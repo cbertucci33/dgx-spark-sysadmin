@@ -24,8 +24,10 @@ The skill emphasizes evidence-led operations. It separates **started**, **ready*
 - Validate bound routing, ICMP, SSH, TCP payloads, `iperf3`, RDMA, and NCCL in both directions.
 - Test every physical fabric rail independently before enabling multi-rail workloads.
 - Monitor CPU, unified memory, swap activity, PSI, storage, thermals, containers, and fabric counters.
-- Temporarily or persistently disable the desktop to reclaim unified-memory headroom.
-- Distinguish ordinary page cache from retained or pinned CUDA/UVM memory.
+- Diagnose post-CUDA memory pressure with a decision tree that separates normal page cache, live owners, and pinned/UVM retention.
+- Install and operate NVIDIA's DGX Spark `sys-cache-cleaner.sh` safely, including one-shot, transient continuous, stop, and verification procedures.
+- Convert hosts to headless operation with a reviewed service inventory, reversible unit changes, worker-first reboot validation, and restoration steps.
+- Audit optional desktop services including GDM/GNOME Remote Desktop, Bluetooth, CUPS, Avahi, ModemManager, UPower, colord, UDisks, and the DGX Dashboard.
 - Restart services, containers, distributed workloads, and hosts using the smallest safe scope.
 - Perform worker-first rolling reboots with boot-identity and post-boot verification.
 - Apply DGX OS, driver, CUDA, and firmware updates through the supported DGX update path.

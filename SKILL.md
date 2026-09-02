@@ -270,31 +270,215 @@ journalctl -p warning..alert --since '<approved-window>' --no-pager
 
 Report the measurement window and workload state. Distinguish free memory, `MemAvailable`, page cache, swap allocated versus fresh `si`/`so`, reserved cache capacity versus active use, and process/cgroup memory versus CUDA/UVM allocation. Stable swap occupancy with no I/O is not active thrashing; PSI shows recent contention. Compare network counters at both ends before and after a bounded workload.
 
-## 7. Reclaim Headroom and Run Headless
+## 7. Reclaim Unified Memory and Run Headless
 
-Inventory first:
+DGX Spark uses unified CPU/GPU memory. A stopped CUDA job can leave the host looking full for three different reasons that require different actions:
+
+1. **Reclaimable file/page cache** — high `Cached`, but usually also high `MemAvailable`.
+2. **A live owner** — process RSS/anonymous memory, a container, a stale distributed rank, or a CUDA/UVM user.
+3. **Unavailable memory with no visible owner** — possible pinned/UVM/driver retention; cache dropping may not repair it.
+
+Never use low `MemFree` alone as evidence of a leak. Prefer `MemAvailable`, then explain `Cached`, `SReclaimable`, swap activity, PSI, processes/cgroups, containers, and CUDA/UVM ownership.
+
+### 7.1 Diagnose before reclaiming
+
+Capture the same snapshot on every affected node before and after cleanup:
 
 ```bash
-systemctl --type=service --state=running --no-pager
+awk '/^(MemTotal|MemFree|MemAvailable|Cached|Buffers|SReclaimable|Shmem|AnonPages|SwapTotal|SwapFree):/ {print}' /proc/meminfo
+cat /proc/pressure/memory
+vmstat 1 5
+swapon --show
+ps -eo pid,ppid,user,rss,vsz,stat,comm,args --sort=-rss | head -40
+systemd-cgtop -b -n 1
+docker ps --no-trunc 2>/dev/null || true
+nvidia-smi
+nvidia-smi pmon -c 1 2>/dev/null || true
+sudo fuser -v /dev/nvidia* 2>/dev/null || true
+```
+
+Before reclaiming anything:
+
+1. Stop only the failed/finished workload through its real launcher or supervisor.
+2. Prove every distributed rank and matching container is gone on every node.
+3. Prove the intended ports are free and no process still owns `/dev/nvidia*`.
+4. Record `MemAvailable`, `Cached`, `AnonPages`, swap `si`/`so`, and PSI.
+
+Use this decision table:
+
+| Evidence | Meaning | Action |
+|---|---|---|
+| `Cached` high and `MemAvailable` also high | Normal reclaimable Linux cache | Do nothing; capacity is available |
+| `AnonPages`, process RSS, cgroup, container, or CUDA owner high | Live allocation | Stop/fix the exact owner; do not hide it with cache dropping |
+| No owner, `Cached` high, `MemAvailable` unexpectedly low after a failed load | Page-cache pressure is plausible | Run one authorized one-shot cache drop, then measure the delta |
+| No owner and one-shot cache drop does not restore expected availability | Not ordinary page cache | Preserve logs and perform a worker-first rolling reboot |
+| Fresh swap-in/out or high memory PSI | Active pressure/thrashing | Quiesce workloads before another model load |
+
+A cache drop is useful before retrying a **failed** large model load when page-cache pressure is proven. If a model loaded successfully, leave it alone; do not run reclaim tools underneath it merely because `MemFree` is low.
+
+If the behavior began after a DGX OS or NVIDIA driver update, also record the exact DGX release, kernel, loaded driver, installed package versions, and bounded kernel logs:
+
+```bash
+cat /etc/dgx-release 2>/dev/null || true
+uname -a
+nvidia-smi --query-gpu=driver_version --format=csv,noheader
+cat /proc/driver/nvidia/version 2>/dev/null || true
+dpkg-query -W 'nvidia*' 'linux-*nvidia*' 2>/dev/null || true
+journalctl -k --since '<workload-stop-time>' --no-pager
+```
+
+Call it a driver/UVM retention problem only when the issue is repeatable, owners are gone, ordinary cache reclaim does not explain or repair it, and logs/version comparison support that conclusion. The cache cleaner is a workaround for UMA page-cache pressure, not proof of a driver leak.
+
+### 7.2 One-shot cache reclaim
+
+NVIDIA's DGX Spark guidance documents manually flushing buffer/page cache for UMA memory pressure:
+
+```bash
+sudo sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches'
+```
+
+Run it only after all relevant ranks and containers are stopped. Then immediately repeat the memory snapshot and report the exact before/after `MemAvailable`, `Cached`, swap activity, and PSI. This command drops clean page cache, dentries, and inodes; it does not terminate owners or guarantee release of pinned/UVM memory.
+
+### 7.3 Install and use NVIDIA's continuous cache cleaner
+
+Current NVIDIA VSS prerequisites publish a DGX Spark cache-cleaner script. Install it from the current NVIDIA documentation rather than downloading an unreviewed copy. The documented implementation is equivalent to:
+
+```bash
+sudo tee /usr/local/bin/sys-cache-cleaner.sh >/dev/null <<'EOF'
+#!/bin/bash
+set -e
+echo 0 > /proc/sys/vm/nr_hugepages
+echo "Starting cache cleaner - Running"
+echo "Press Ctrl+C or stop its service to exit"
+while true; do
+  sync
+  echo 3 > /proc/sys/vm/drop_caches
+  sleep 3
+done
+EOF
+sudo chmod 0755 /usr/local/bin/sys-cache-cleaner.sh
+sudo test -x /usr/local/bin/sys-cache-cleaner.sh
+```
+
+The script does two consequential things: it sets runtime huge pages to zero and drops page cache every three seconds. Record the original huge-page count first:
+
+```bash
+cat /proc/sys/vm/nr_hugepages
+```
+
+Prefer a transient systemd unit so the cleaner is observable, easy to stop, and does not silently persist across reboot:
+
+```bash
+sudo systemd-run --unit=sys-cache-cleaner \
+  --property=Description='NVIDIA DGX Spark cache cleaner' \
+  /usr/local/bin/sys-cache-cleaner.sh
+systemctl is-active sys-cache-cleaner.service
+systemctl status sys-cache-cleaner.service --no-pager
+journalctl -u sys-cache-cleaner.service -n 20 --no-pager
+```
+
+Stop it when the memory-sensitive deployment or recovery window ends:
+
+```bash
+sudo systemctl stop sys-cache-cleaner.service
+systemctl is-active sys-cache-cleaner.service
+```
+
+Restore a nonzero prior huge-page value only if one was recorded and the host's workload requires it:
+
+```bash
+sudo sysctl vm.nr_hugepages=<recorded-prior-value>
+```
+
+Do not make the cleaner persistent by default. Continuous cache eviction can reduce filesystem/model reload performance, and the huge-page change may affect other workloads. Use the one-shot command first for ordinary failed-load cleanup; use the continuous cleaner only when a repeatable workload needs it or current NVIDIA guidance for that deployment requires it. Verify that `pgrep -af sys-cache-cleaner.sh` shows no duplicate cleaners.
+
+### 7.4 Headless-service audit
+
+Inventory service enablement, activation, and memory before deciding what is nonessential:
+
+```bash
+systemctl get-default
+loginctl list-sessions
 systemctl status display-manager --no-pager
-docker ps --no-trunc
+systemctl --type=service --state=running --no-pager
+systemctl list-unit-files --type=service --no-pager
+systemd-cgtop -b -n 1
 ps -eo pid,ppid,%cpu,%mem,rss,comm,args --sort=-rss
 ```
 
-Identify desktop sessions, browsers, remote desktop, notebooks, indexers, containers, compilers, and model servers by exact identity. Do not blindly stop SSH, NetworkManager, Tailscale, time sync, required container runtime, or NVIDIA platform services.
+Common **candidates** on an SSH-only Spark are:
 
-Before stopping the GUI, verify two management paths, no active desktop user, current default target, display-manager identity, memory/PSI baseline, and restore command. With authorization:
+- `display-manager.service`, GDM, and GNOME Remote Desktop;
+- `bluetooth.service`;
+- `cups.service` and `cups-browsed.service`;
+- `avahi-daemon.service` when mDNS discovery is not used;
+- `ModemManager.service` when no cellular modem is used;
+- `switcheroo-control.service` on a fixed-GPU server;
+- `upower.service` on a noninteractive headless appliance;
+- `colord.service` when no display/color workflow exists;
+- `udisks2.service` when removable-media automount/desktop storage management is not needed;
+- `dgx-dashboard.service`, `dgx-dashboard-admin.service`, and `dgxstation-desktop.service` only when administration is exclusively through SSH and the DGX Dashboard is intentionally relinquished.
+
+Do **not** disable SSH, NetworkManager/systemd-networkd, Tailscale used for recovery, time synchronization, Docker/containerd used by workloads, NVIDIA persistence/power/fabric services, `dgx-release.service`, storage needed by models, or an unfamiliar unit merely because its name looks desktop-related. Unit presence and names vary by DGX OS release; discover them live.
+
+### 7.5 Convert one node to headless operation
+
+Before any persistent change, require explicit authorization, two proven management paths, no active desktop user, current default target, display-manager identity, a memory/PSI baseline, and exact restore commands.
+
+First test temporary GUI shutdown:
 
 ```bash
-sudo systemctl stop display-manager      # temporary
-sudo systemctl start display-manager     # restore
-sudo systemctl set-default multi-user.target  # persistent after validated test
-sudo systemctl set-default graphical.target   # restore desktop boot
+sudo systemctl stop display-manager.service
+systemctl is-active display-manager.service
 ```
 
-Measure actual `MemAvailable`/PSI improvement. Persistent target changes require a maintenance reboot to prove remote access, CUDA, networking, and workloads.
+If remote access, CUDA, networking, and workloads remain healthy, configure headless boot:
 
-After a large CUDA workload stops, prove all ranks/containers/CUDA processes are gone on every node, then recheck memory, swap activity, and PSI. Page-cache reclamation requires authorization and `sync`; it does not fix pinned/unowned UVM memory. If memory stays unavailable without an owner, preserve driver/kernel logs and perform a rolling reboot rather than repeatedly launching into allocation failure.
+```bash
+sudo systemctl set-default multi-user.target
+systemctl get-default
+```
+
+Disable only reviewed, present units. A typical candidate set is:
+
+```bash
+sudo systemctl disable --now \
+  gnome-remote-desktop.service bluetooth.service \
+  cups.service cups-browsed.service avahi-daemon.service \
+  ModemManager.service switcheroo-control.service
+```
+
+D-Bus or socket activation can restart `upower`, `colord`, or `udisks2` even when a service is disabled. Mask these only after proving their functions are unnecessary:
+
+```bash
+sudo systemctl mask --now upower.service colord.service udisks2.service
+```
+
+If the DGX Dashboard is intentionally removed from the operating path:
+
+```bash
+sudo systemctl disable --now \
+  dgx-dashboard.service dgx-dashboard-admin.service dgxstation-desktop.service
+```
+
+A unit missing from the host is not an error; a unit unexpectedly still active after disable/mask is. Record each actual state instead of hiding errors with a broad `|| true`.
+
+Reboot only the worker/non-coordinator first. Verify changed boot ID, SSH/Tailscale recovery, `multi-user.target`, disabled/masked units, NVIDIA driver/CUDA, management and fabric networking, storage, containers, memory/PSI, and a real workload request. Only then apply and verify the peer.
+
+### 7.6 Restore desktop operation
+
+Use the recorded unit list rather than blindly enabling every candidate:
+
+```bash
+sudo systemctl unmask upower.service colord.service udisks2.service
+sudo systemctl enable <previously-enabled-units>
+sudo systemctl set-default graphical.target
+sudo systemctl start display-manager.service
+systemctl get-default
+systemctl is-active display-manager.service
+```
+
+A maintenance reboot is the final proof that the desktop and chosen services return. Re-measure `MemAvailable`, PSI, service memory, and workload behavior before declaring the headless change beneficial.
 
 ## 8. Restart, Reboot, and Shutdown
 
@@ -376,7 +560,8 @@ Post-update, compare peer/before manifests and verify package health, DGX releas
 | Symptom | Required distinction/action |
 |---|---|
 | GPU memory unsupported in `nvidia-smi` | Use OS unified-memory, PSI, swap, process/cgroup, and workload counters together |
-| Memory remains used after CUDA exit | Separate page cache from pinned/unowned UVM; prove no owner; collect logs; rolling reboot if unrecovered |
+| Memory remains used after CUDA exit | Separate page cache, live owners, and pinned/unowned UVM; use one-shot reclaim only for proven cache pressure; collect driver/kernel evidence; rolling reboot if unrecovered |
+| Cache cleaner appears to fix an updated-driver issue | Record before/after memory and driver evidence; cache relief alone does not prove a driver leak |
 | `nvidia-smi` works but build/runtime fails | Compare loaded driver, installed packages, kernel modules, CUDA toolkit, container runtime, and noninteractive PATH |
 | Fabric works one way | Bind source/interface in both directions; inspect routes, neighbors, reverse-path filtering, firewall, and counters |
 | Jumbo MTU configured | Prove do-not-fragment payloads both ways and benchmark before/after; preserve rollback |
@@ -430,6 +615,8 @@ Check at execution time:
 - https://docs.nvidia.com/dgx/dgx-spark/spark-clustering.html
 - https://build.nvidia.com/spark/connect-two-sparks
 - https://build.nvidia.com/spark/nccl
+- https://docs.nvidia.com/vss/latest/prerequisites.html
+- https://build.nvidia.com/spark/vss/troubleshooting
 - https://tailscale.com/docs/install/linux
 - https://tailscale.com/docs/features/magicdns
 - https://tailscale.com/docs/features/tailscale-ssh
