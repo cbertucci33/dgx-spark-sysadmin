@@ -270,53 +270,31 @@ journalctl -p warning..alert --since '<approved-window>' --no-pager
 
 Report the measurement window and workload state. Distinguish free memory, `MemAvailable`, page cache, swap allocated versus fresh `si`/`so`, reserved cache capacity versus active use, and process/cgroup memory versus CUDA/UVM allocation. Stable swap occupancy with no I/O is not active thrashing; PSI shows recent contention. Compare network counters at both ends before and after a bounded workload.
 
-## 7. Reclaim Unified Memory and Run Headless
+## 7. Reclaim Memory and Run Headless
 
-DGX Spark uses unified CPU/GPU memory. A stopped CUDA job can leave the host looking full for three different reasons that require different actions:
+### 7.1 Decide whether reclaim is needed
 
-1. **Reclaimable file/page cache** — high `Cached`, but usually also high `MemAvailable`.
-2. **A live owner** — process RSS/anonymous memory, a container, a stale distributed rank, or a CUDA/UVM user.
-3. **Unavailable memory with no visible owner** — possible pinned/UVM/driver retention; cache dropping may not repair it.
-
-Never use low `MemFree` alone as evidence of a leak. Prefer `MemAvailable`, then explain `Cached`, `SReclaimable`, swap activity, PSI, processes/cgroups, containers, and CUDA/UVM ownership.
-
-### 7.1 Diagnose before reclaiming
-
-Capture the same snapshot on every affected node before and after cleanup:
+After a failed or stopped CUDA workload, run on every affected node:
 
 ```bash
-awk '/^(MemTotal|MemFree|MemAvailable|Cached|Buffers|SReclaimable|Shmem|AnonPages|SwapTotal|SwapFree):/ {print}' /proc/meminfo
+awk '/^(MemFree|MemAvailable|Cached|SReclaimable|AnonPages|SwapTotal|SwapFree):/ {print}' /proc/meminfo
 cat /proc/pressure/memory
 vmstat 1 5
-swapon --show
-ps -eo pid,ppid,user,rss,vsz,stat,comm,args --sort=-rss | head -40
+ps -eo pid,ppid,user,rss,stat,comm,args --sort=-rss | head -40
 systemd-cgtop -b -n 1
 docker ps --no-trunc 2>/dev/null || true
 nvidia-smi
-nvidia-smi pmon -c 1 2>/dev/null || true
 sudo fuser -v /dev/nvidia* 2>/dev/null || true
 ```
 
-Before reclaiming anything:
+1. Prove every workload rank and matching container has stopped.
+2. If a process, cgroup, container, or CUDA device owner remains, stop that owner; do not drop caches.
+3. If `MemAvailable` is high, do nothing. Low `MemFree` alone is not pressure.
+4. If `MemAvailable` is low, no owner remains, and `Cached` is high, run one one-shot cache reclaim.
+5. If one-shot reclaim does not restore expected availability, collect driver/kernel evidence and perform a worker-first rolling reboot.
+6. If the model loaded successfully, leave it running; do not reclaim memory underneath it.
 
-1. Stop only the failed/finished workload through its real launcher or supervisor.
-2. Prove every distributed rank and matching container is gone on every node.
-3. Prove the intended ports are free and no process still owns `/dev/nvidia*`.
-4. Record `MemAvailable`, `Cached`, `AnonPages`, swap `si`/`so`, and PSI.
-
-Use this decision table:
-
-| Evidence | Meaning | Action |
-|---|---|---|
-| `Cached` high and `MemAvailable` also high | Normal reclaimable Linux cache | Do nothing; capacity is available |
-| `AnonPages`, process RSS, cgroup, container, or CUDA owner high | Live allocation | Stop/fix the exact owner; do not hide it with cache dropping |
-| No owner, `Cached` high, `MemAvailable` unexpectedly low after a failed load | Page-cache pressure is plausible | Run one authorized one-shot cache drop, then measure the delta |
-| No owner and one-shot cache drop does not restore expected availability | Not ordinary page cache | Preserve logs and perform a worker-first rolling reboot |
-| Fresh swap-in/out or high memory PSI | Active pressure/thrashing | Quiesce workloads before another model load |
-
-A cache drop is useful before retrying a **failed** large model load when page-cache pressure is proven. If a model loaded successfully, leave it alone; do not run reclaim tools underneath it merely because `MemFree` is low.
-
-If the behavior began after a DGX OS or NVIDIA driver update, also record the exact DGX release, kernel, loaded driver, installed package versions, and bounded kernel logs:
+For a suspected post-update driver/UVM issue, record:
 
 ```bash
 cat /etc/dgx-release 2>/dev/null || true
@@ -327,29 +305,25 @@ dpkg-query -W 'nvidia*' 'linux-*nvidia*' 2>/dev/null || true
 journalctl -k --since '<workload-stop-time>' --no-pager
 ```
 
-Call it a driver/UVM retention problem only when the issue is repeatable, owners are gone, ordinary cache reclaim does not explain or repair it, and logs/version comparison support that conclusion. The cache cleaner is a workaround for UMA page-cache pressure, not proof of a driver leak.
+Label it driver/UVM retention only when no owner remains, one-shot cache reclaim fails, the behavior is repeatable, and the version/log evidence supports that conclusion.
 
-### 7.2 One-shot cache reclaim
+### 7.2 Reclaim page cache
 
-NVIDIA's DGX Spark guidance documents manually flushing buffer/page cache for UMA memory pressure:
+Use NVIDIA's documented one-shot command first:
 
 ```bash
 sudo sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches'
 ```
 
-Run it only after all relevant ranks and containers are stopped. Then immediately repeat the memory snapshot and report the exact before/after `MemAvailable`, `Cached`, swap activity, and PSI. This command drops clean page cache, dentries, and inodes; it does not terminate owners or guarantee release of pinned/UVM memory.
+Repeat the section 7.1 snapshot and report the before/after `MemAvailable`, `Cached`, swap activity, and PSI.
 
-### 7.3 Install and use NVIDIA's continuous cache cleaner
-
-Current NVIDIA VSS prerequisites publish a DGX Spark cache-cleaner script. Install it from the current NVIDIA documentation rather than downloading an unreviewed copy. The documented implementation is equivalent to:
+For workloads that repeatedly require NVIDIA's continuous cache cleaner, install it once:
 
 ```bash
 sudo tee /usr/local/bin/sys-cache-cleaner.sh >/dev/null <<'EOF'
 #!/bin/bash
 set -e
 echo 0 > /proc/sys/vm/nr_hugepages
-echo "Starting cache cleaner - Running"
-echo "Press Ctrl+C or stop its service to exit"
 while true; do
   sync
   echo 3 > /proc/sys/vm/drop_caches
@@ -360,41 +334,41 @@ sudo chmod 0755 /usr/local/bin/sys-cache-cleaner.sh
 sudo test -x /usr/local/bin/sys-cache-cleaner.sh
 ```
 
-The script does two consequential things: it sets runtime huge pages to zero and drops page cache every three seconds. Record the original huge-page count first:
+Record the current huge-page value before starting it:
 
 ```bash
 cat /proc/sys/vm/nr_hugepages
 ```
 
-Prefer a transient systemd unit so the cleaner is observable, easy to stop, and does not silently persist across reboot:
+Run it as a nonpersistent transient service:
 
 ```bash
 sudo systemd-run --unit=sys-cache-cleaner \
   --property=Description='NVIDIA DGX Spark cache cleaner' \
   /usr/local/bin/sys-cache-cleaner.sh
 systemctl is-active sys-cache-cleaner.service
-systemctl status sys-cache-cleaner.service --no-pager
-journalctl -u sys-cache-cleaner.service -n 20 --no-pager
+test "$(pgrep -fc '[s]ys-cache-cleaner.sh')" -eq 1
 ```
 
-Stop it when the memory-sensitive deployment or recovery window ends:
+Require exactly one cleaner process. Stop it when the workload or recovery window ends:
 
 ```bash
 sudo systemctl stop sys-cache-cleaner.service
-systemctl is-active sys-cache-cleaner.service
+systemctl show sys-cache-cleaner.service -p ActiveState --value
+test "$(pgrep -fc '[s]ys-cache-cleaner.sh')" -eq 0
 ```
 
-Restore a nonzero prior huge-page value only if one was recorded and the host's workload requires it:
+If the recorded huge-page value was nonzero and the workload requires it, restore it:
 
 ```bash
 sudo sysctl vm.nr_hugepages=<recorded-prior-value>
 ```
 
-Do not make the cleaner persistent by default. Continuous cache eviction can reduce filesystem/model reload performance, and the huge-page change may affect other workloads. Use the one-shot command first for ordinary failed-load cleanup; use the continuous cleaner only when a repeatable workload needs it or current NVIDIA guidance for that deployment requires it. Verify that `pgrep -af sys-cache-cleaner.sh` shows no duplicate cleaners.
+Do not enable the cleaner at boot by default. It drops page cache every three seconds and sets runtime huge pages to zero.
 
-### 7.4 Headless-service audit
+### 7.3 Audit headless services
 
-Inventory service enablement, activation, and memory before deciding what is nonessential:
+Before changing services, require explicit authorization, two verified management paths, no active desktop user, and recorded rollback commands. Inventory:
 
 ```bash
 systemctl get-default
@@ -403,43 +377,38 @@ systemctl status display-manager --no-pager
 systemctl --type=service --state=running --no-pager
 systemctl list-unit-files --type=service --no-pager
 systemd-cgtop -b -n 1
-ps -eo pid,ppid,%cpu,%mem,rss,comm,args --sort=-rss
 ```
 
-Common **candidates** on an SSH-only Spark are:
+Review these headless candidates individually:
 
-- `display-manager.service`, GDM, and GNOME Remote Desktop;
+- display manager/GDM and `gnome-remote-desktop.service`;
 - `bluetooth.service`;
 - `cups.service` and `cups-browsed.service`;
-- `avahi-daemon.service` when mDNS discovery is not used;
+- `avahi-daemon.service` when mDNS is unused;
 - `ModemManager.service` when no cellular modem is used;
-- `switcheroo-control.service` on a fixed-GPU server;
-- `upower.service` on a noninteractive headless appliance;
-- `colord.service` when no display/color workflow exists;
-- `udisks2.service` when removable-media automount/desktop storage management is not needed;
-- `dgx-dashboard.service`, `dgx-dashboard-admin.service`, and `dgxstation-desktop.service` only when administration is exclusively through SSH and the DGX Dashboard is intentionally relinquished.
+- `switcheroo-control.service`;
+- `upower.service`, `colord.service`, and `udisks2.service` when their desktop functions are unused;
+- `dgx-dashboard.service`, `dgx-dashboard-admin.service`, and `dgxstation-desktop.service` when the DGX Dashboard is not part of administration.
 
-Do **not** disable SSH, NetworkManager/systemd-networkd, Tailscale used for recovery, time synchronization, Docker/containerd used by workloads, NVIDIA persistence/power/fabric services, `dgx-release.service`, storage needed by models, or an unfamiliar unit merely because its name looks desktop-related. Unit presence and names vary by DGX OS release; discover them live.
+Do not disable SSH, the active network manager, recovery Tailscale, time synchronization, required Docker/containerd, NVIDIA persistence/power/fabric services, `dgx-release.service`, or required storage services.
 
-### 7.5 Convert one node to headless operation
+### 7.4 Convert one node to headless operation
 
-Before any persistent change, require explicit authorization, two proven management paths, no active desktop user, current default target, display-manager identity, a memory/PSI baseline, and exact restore commands.
-
-First test temporary GUI shutdown:
+Test temporary GUI shutdown first:
 
 ```bash
 sudo systemctl stop display-manager.service
-systemctl is-active display-manager.service
+systemctl show display-manager.service -p ActiveState --value
 ```
 
-If remote access, CUDA, networking, and workloads remain healthy, configure headless boot:
+Verify SSH/Tailscale, networking, storage, CUDA, and required workloads. Then configure headless boot:
 
 ```bash
 sudo systemctl set-default multi-user.target
 systemctl get-default
 ```
 
-Disable only reviewed, present units. A typical candidate set is:
+Disable only units confirmed present and unnecessary:
 
 ```bash
 sudo systemctl disable --now \
@@ -448,26 +417,35 @@ sudo systemctl disable --now \
   ModemManager.service switcheroo-control.service
 ```
 
-D-Bus or socket activation can restart `upower`, `colord`, or `udisks2` even when a service is disabled. Mask these only after proving their functions are unnecessary:
+Mask D-Bus-activated desktop services only when their functions are confirmed unnecessary:
 
 ```bash
 sudo systemctl mask --now upower.service colord.service udisks2.service
 ```
 
-If the DGX Dashboard is intentionally removed from the operating path:
+Disable the DGX Dashboard only when SSH-only administration is accepted:
 
 ```bash
 sudo systemctl disable --now \
   dgx-dashboard.service dgx-dashboard-admin.service dgxstation-desktop.service
 ```
 
-A unit missing from the host is not an error; a unit unexpectedly still active after disable/mask is. Record each actual state instead of hiding errors with a broad `|| true`.
+Reboot and verify the worker/non-coordinator first. Require:
 
-Reboot only the worker/non-coordinator first. Verify changed boot ID, SSH/Tailscale recovery, `multi-user.target`, disabled/masked units, NVIDIA driver/CUDA, management and fabric networking, storage, containers, memory/PSI, and a real workload request. Only then apply and verify the peer.
+- changed boot ID and `multi-user.target`;
+- both management paths;
+- expected unit states;
+- NVIDIA driver/CUDA;
+- management and fabric networking;
+- storage and containers;
+- memory/PSI baseline;
+- a functional workload request.
 
-### 7.6 Restore desktop operation
+Only then repeat on the coordinator/peer.
 
-Use the recorded unit list rather than blindly enabling every candidate:
+### 7.5 Restore desktop operation
+
+Use the recorded pre-change unit states:
 
 ```bash
 sudo systemctl unmask upower.service colord.service udisks2.service
@@ -478,7 +456,7 @@ systemctl get-default
 systemctl is-active display-manager.service
 ```
 
-A maintenance reboot is the final proof that the desktop and chosen services return. Re-measure `MemAvailable`, PSI, service memory, and workload behavior before declaring the headless change beneficial.
+Reboot one node at a time and verify the desktop plus all required management, CUDA, network, storage, and workload paths.
 
 ## 8. Restart, Reboot, and Shutdown
 
@@ -528,7 +506,7 @@ Before `sudo systemctl poweroff`, state and verify the recovery mechanism (physi
 
 ## 9. DGX OS, Driver, CUDA, and Firmware Updates
 
-Treat DGX Spark as a coordinated appliance stack. Read current release notes and the official update guide. Prefer DGX Dashboard. Require stable power, backup, recovery access, stopped workloads, a maintenance window, and before-manifests from every node.
+Treat DGX Spark as a coordinated appliance stack. Read the current release documentation and official update guide. Prefer DGX Dashboard. Require stable power, backup, recovery access, stopped workloads, a maintenance window, and before-manifests from every node.
 
 Preflight:
 
@@ -555,7 +533,7 @@ Inspect each step; do not hide errors in a command chain. Update and fully valid
 
 Post-update, compare peer/before manifests and verify package health, DGX release, kernel, loaded driver, CUDA realpath/compiler, firmware, container runtime, SSH/Tailscale, ConnectX mapping and two-way traffic, RoCE/RDMA/NCCL, CUDA initialization in the intended runtime, and real application performance.
 
-## Gotchas
+## Failure Handling
 
 | Symptom | Required distinction/action |
 |---|---|
