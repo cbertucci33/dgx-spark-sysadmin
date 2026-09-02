@@ -40,6 +40,57 @@ For each additional rail, define another complete fabric tuple.
 
 The fabric must not become a default route or the only recovery path.
 
+### Management-host execution
+
+OpenClaw may run from a Linux shell or Windows PowerShell. Commands in this skill execute on the Linux DGX host unless labeled as management-host commands. Use OpenSSH with noninteractive failure and a connection timeout.
+
+From a Linux management host:
+
+```bash
+export DGX_TARGET='<admin-user>@<node-management-name>'
+export DGX_KEY='<ssh-key-path>'
+ssh -o BatchMode=yes -o ConnectTimeout=10 -i "$DGX_KEY" "$DGX_TARGET" \
+  'hostname; uptime'
+```
+
+Run a multiline remote script from Linux without local interpolation:
+
+```bash
+ssh -o BatchMode=yes -o ConnectTimeout=10 -i "$DGX_KEY" "$DGX_TARGET" \
+  'bash -se' <<'REMOTE'
+set -euo pipefail
+hostname
+free -h
+REMOTE
+```
+
+From a PowerShell management host:
+
+```powershell
+$DgxTarget = '<admin-user>@<node-management-name>'
+$DgxKey = '<ssh-key-path>'
+ssh -o BatchMode=yes -o ConnectTimeout=10 -i $DgxKey $DgxTarget `
+  'hostname; uptime'
+if ($LASTEXITCODE -ne 0) { throw "SSH failed: $LASTEXITCODE" }
+```
+
+Run a multiline remote script from PowerShell by UTF-8/base64 encoding it; do not rely on PowerShell pipeline encoding or interpolate it into a shell command:
+
+```powershell
+$RemoteScript = @'
+set -euo pipefail
+hostname
+free -h
+'@
+$Utf8 = [Text.UTF8Encoding]::new($false)
+$Encoded = [Convert]::ToBase64String($Utf8.GetBytes(($RemoteScript -replace "`r`n", "`n")))
+ssh -o BatchMode=yes -o ConnectTimeout=10 -i $DgxKey $DgxTarget `
+  "printf '%s' '$Encoded' | base64 -d | bash -se"
+if ($LASTEXITCODE -ne 0) { throw "SSH failed: $LASTEXITCODE" }
+```
+
+For read-only fan-out, iterate over an explicit node list and retain each host's exit code. Serialize state changes and verification. Do not translate DGX-side commands into PowerShell; PowerShell only launches SSH.
+
 ### Change rules
 
 1. Read-only discovery may run in parallel. Preserve per-host stdout, stderr, duration, and exit code.
